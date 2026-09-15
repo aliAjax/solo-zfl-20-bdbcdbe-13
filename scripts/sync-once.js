@@ -72,6 +72,7 @@ async function main() {
             duplicate: (d.duplicate || []).length,
             quarantined: (d.quarantined || []).length,
             missing: d.missing || [],
+            peerCapabilities: d.peerCapabilities || null,
             conflictsPending: conflicts,
             replayConvergent: convergent
           },

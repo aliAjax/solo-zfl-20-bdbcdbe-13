@@ -84,8 +84,8 @@ function enrichBatch(db, batch) {
   };
 }
 
-async function createServer({ site = SITE, dataDir = DATA_DIR, port = 0, failWrites = FAIL_WRITES } = {}) {
-  const replica = new Replica(site, dataDir, { failWrites });
+async function createServer({ site = SITE, dataDir = DATA_DIR, port = 0, failWrites = FAIL_WRITES, legacy = false } = {}) {
+  const replica = new Replica(site, dataDir, { failWrites, legacy });
   await replica.init();
   const peers = parsePeerMap();
 
@@ -308,29 +308,46 @@ async function createServer({ site = SITE, dataDir = DATA_DIR, port = 0, failWri
           conflicts: replica.conflicts().length,
           stateHash,
           replayHash,
-          replayConvergent: stateHash === replayHash
+          replayConvergent: stateHash === replayHash,
+          protocol: replica.protocolVersion(),
+          capabilities: replica.capabilities()
         }
       });
     }
 
-    // 对端拉取增量：{ site, vclock } -> { ops, peerVclock }
+    // 对端拉取增量：{ site, vclock, capabilities? } -> { ops, peerVclock, protocol, capabilities }
+    // 请求方声明能力，导出方据此裁剪（旧副本拿不到墓碑标记）。
     if (req.method === "POST" && pathname === "/sync/pull") {
       const body = await parseBody(req);
       const vclock = body.vclock && typeof body.vclock === "object" ? body.vclock : {};
-      return send(res, 200, { ops: replica.since(vclock), peerVclock: replica.meta().vclock });
+      const requesterCaps = body.capabilities && typeof body.capabilities === "object" ? body.capabilities : null;
+      // 未声明能力 = 旧副本，按最保守（无墓碑）裁剪，保证旧端不会收到无法识别的协议数据。
+      const caps = requesterCaps || { tombstones: false };
+      const ops = replica.since(vclock, { capabilities: caps });
+      return send(res, 200, {
+        ops,
+        peerVclock: replica.meta().vclock,
+        protocol: replica.protocolVersion(),
+        capabilities: replica.capabilities()
+      });
     }
 
-    // 对端推送增量：{ site, ops } -> { report, peerVclock }，整包幂等
+    // 对端推送增量：{ site, ops, capabilities? } -> { report, peerVclock, ... }，整包幂等
     if (req.method === "POST" && pathname === "/sync/push") {
       const body = await parseBody(req);
       if (!Array.isArray(body.ops)) return send(res, 400, { error: "ops必须是数组" });
       try {
         const report = await replica.applyRemote(body.ops, body.site || "unknown");
-        return send(res, 200, { data: report, peerVclock: replica.meta().vclock });
+        return send(res, 200, {
+          data: report,
+          peerVclock: replica.meta().vclock,
+          protocol: replica.protocolVersion(),
+          capabilities: replica.capabilities()
+        });
       } catch (error) {
-        // 整包校验失败时无任何操作生效，对端可原样重发
+        // 整包校验失败（含无法识别的协议字段）时无任何操作生效，对端可原样重发
         const status = error.status === 400 ? 409 : error.status || 409;
-        return send(res, status, { error: error.message, retryable: true });
+        return send(res, status, { error: error.message, retryable: true, protocol: replica.protocolVersion(), capabilities: replica.capabilities() });
       }
     }
 

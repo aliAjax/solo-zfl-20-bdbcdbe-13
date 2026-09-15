@@ -106,7 +106,9 @@
     "conflicts": 1,
     "stateHash": "…",
     "replayHash": "…",
-    "replayConvergent": true
+    "replayConvergent": true,
+    "protocol": 3,
+    "capabilities": { "tombstones": true, "conflicts": true }
   }
 }
 ```
@@ -140,20 +142,42 @@
 ```
 
 - `applied`：本轮真正生效的操作；`duplicate`：重复收到、只计一次的操作；
-  `quarantined`：缺前序被隔离的操作；`missing`：尚缺的前序 `opId`。
-  （`rejected` 字段保留但恒为空：非法操作不再软拒绝入日志，而是整包硬失败，见 `/sync/push`。）
+  `quarantined`：缺前序被隔离的操作；`missing`：尚缺的前序 `opId`；
+  `rejected`：补链时被确认非法、以“拒绝墓碑”占位的操作（详见 `/sync/push`）。
 - 同一组操作无论以什么顺序、分多少批到达，最终状态哈希与冲突集合完全一致，在线投影与重放投影一致。
 - 网络中断返回 `502 { error, partial, retryable:true }`：已生效进度保留，重试自动续传。
 
-### 5. `POST /sync/pull` —— 增量拉取原语
+### 5. `POST /sync/pull` —— 增量拉取原语（带能力协商）
 
-请求 `{ "site": "请求方馆号", "vclock": { "hallA": 12 } }`，
-响应 `{ "ops": [ ...请求方缺失的操作 ], "peerVclock": { ...本馆当前时钟 } }`。
-`vclock` 省略或给 `{}` 表示要全部非 seed 操作（新馆初始化用）。
+请求：
+
+```json
+{ "site": "请求方馆号", "vclock": { "hallA": 12 }, "capabilities": { "tombstones": true } }
+```
+
+响应：
+
+```json
+{
+  "ops": [ "...请求方缺失且其能力可安全接收的操作..." ],
+  "peerVclock": { "...本馆当前时钟..." },
+  "protocol": 3,
+  "capabilities": { "tombstones": true, "conflicts": true }
+}
+```
+
+- `vclock` 省略或给 `{}` 表示要全部非 seed 操作（新馆初始化用）。
+- **能力协商（跨版本兼容）**：
+  - 新副本（协议 v3）请求时带 `capabilities.tombstones: true`，可收到带墓碑标记的操作；
+  - 旧副本（协议 v2）不发送 `capabilities` 或发送 `tombstones:false`，导出方据此
+    **裁剪掉所有墓碑以及因果上依赖墓碑的后继**，只返回“每个站点首个墓碑之前”的连续安全前缀，
+    保证旧副本不会收到它无法解释的协议数据、不会整包失败；
+  - 旧副本升级为新版后，正常声明 `tombstones:true` 再拉一次，被裁剪的墓碑与后继自动补齐，最终收敛。
 
 ### 6. `POST /sync/push` —— 幂等推送原语
 
-请求 `{ "site": "发送方馆号", "ops": [ ... ] }`，响应 `{ data: <摄入报告>, peerVclock }`。
+请求 `{ "site": "发送方馆号", "ops": [ ... ], "capabilities": { "tombstones": true } }`，
+响应 `{ data: <摄入报告>, peerVclock, protocol, capabilities }`。
 
 - 同一 `opId` 重复投递（重发、批内重复）只生效一次，计入 `duplicate`。
 - 缺前序的操作计入 `quarantined` 并在 `missing` 给出缺口，补链后自动按原因果顺序生效。
@@ -166,7 +190,10 @@
   - 同批补来的合法前序正常生效（不会被坏后继连累回滚）；
   - 坏操作以“拒绝墓碑”占位：进入操作日志、占住站内序号（使后继不再断链）、不产生任何业务状态，
     计入响应 `rejected`，原因在 `rejectionReasons[opId]`，并可在 `GET /sync/status` 的 `invalid` 中查到；
-  - 墓碑会随同步传播，其他馆确定性地占位（不会对它再报 409），各馆最终仍收敛一致；
+  - 墓碑只向**声明了 `tombstones` 能力的新副本**传播（操作带 `__invalid` 标记，接收方确定性占位、
+    不再报 409）；旧副本经能力协商收不到墓碑及后继，升级后自动补齐（见 pull）；
+  - **无法安全识别的协议数据 fail-closed**：操作上出现本副本不认识的 `__` 前缀字段
+    （来自更新版本的协议扩展）时，整包 `409` 拒绝、不改动任何已落盘状态；
   - 重发合法前序是幂等的，坏操作不会再回到隔离区。
 - 同一组合法操作只改变投递顺序或分批方式，最终得到**同一状态哈希与同一冲突集合**，
   且在线投影与重放投影一致。

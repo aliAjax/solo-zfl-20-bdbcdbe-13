@@ -130,7 +130,8 @@ test("回归一：任意投递顺序/分批 -> 同一状态、同一冲突集合
   await patch(Q, "/damages/damage_demo_1", { position: "Q方后续位置" });
 
   // 收集操作全集（去重）
-  const pull = (s, vclock) => post(s, "/sync/pull", { site: "collector", vclock });
+  const pull = (s, vclock) =>
+    post(s, "/sync/pull", { site: "collector", vclock, capabilities: { tombstones: true, conflicts: true } });
   const fromP = (await pull(P, { seed: 3 })).body.ops;
   const fromQ = (await pull(Q, { seed: 3 })).body.ops;
   const all = [];
@@ -383,7 +384,13 @@ test("回归三：非法后继先隔离，补链时合法前序生效、坏后�
   assert.equal(t1.status, 200);
   assert.deepEqual(t1.body.data.quarantined, ["badX:3"]);
   // 从 R2 拉取它已落定的操作（X:2 带 __invalid 墓碑标记）并推给 T
-  const pulled = (await post(R2, "/sync/pull", { site: "quarT", vclock: { seed: 3 } })).body.ops;
+  const pulled = (
+    await post(R2, "/sync/pull", {
+      site: "quarT",
+      vclock: { seed: 3 },
+      capabilities: { tombstones: true, conflicts: true }
+    })
+  ).body.ops;
   const ids = pulled.map((o) => o.opId).sort();
   assert.deepEqual(ids, ["badX:1", "badX:2", "badX:3"]);
   assert.equal(pulled.find((o) => o.opId === "badX:2").__invalid, true);
