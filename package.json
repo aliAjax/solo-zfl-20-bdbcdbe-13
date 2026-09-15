@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test test/",
+    "test:fuzz": "node scripts/fuzz-order.js && node scripts/fuzz-random.js",
     "sync": "node scripts/sync-once.js"
   },
   "engines": {

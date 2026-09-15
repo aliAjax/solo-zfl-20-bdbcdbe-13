@@ -368,6 +368,15 @@ async function createServer({ site = SITE, dataDir = DATA_DIR, port = 0, failWri
       if (!replica.fieldVersion(loc.entity, loc.entityId)) {
         return send(res, 404, { error: "实体不存在" });
       }
+      // 人工接口即时守卫：只能裁决当前确实存在的字段冲突。
+      // 引擎层裁决是纯因果写入（不做此顺序相关判断），保证同步/重放顺序无关；
+      // 这里仅服务人工调用，重复裁决或裁决已解决字段返回 409。
+      const exists = replica
+        .conflicts()
+        .some((c) => c.entity === loc.entity && c.entityId === loc.entityId && c.field === loc.field);
+      if (!exists) {
+        return send(res, 409, { error: "该字段当前不存在冲突（可能已被裁决）" });
+      }
       try {
         const op = await replica.mutate(() => ({
           type: "conflict.resolve",

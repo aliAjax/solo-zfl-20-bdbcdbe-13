@@ -80,10 +80,10 @@ test("线性更新中后到的旧值被支配时直接忽略，不产生冲突",
   assert.equal(C.stateHash(true), C.stateHash());
 });
 
-test("被业务规则拒绝的操作跨馆重放结果一致（占用序号、不留状态差异）", () => {
+test("非法操作硬失败：本地不入日志；同步入口整包不生效（合法同包操作也不落地）", () => {
   const A = new Engine("A");
   A.seed();
-  // 直接构造一个引用不存在拓片的缺损登记（防御路径：对端异常/旧版本客户端）
+  // 本地直接构造一个引用不存在拓片的缺损登记：提交抛错，且不占序号、不留状态
   const bad = A.nextOp("damage.create", {
     id: "damage_ghost",
     fields: {
@@ -100,18 +100,28 @@ test("被业务规则拒绝的操作跨馆重放结果一致（占用序号、�
     }
   });
   assert.throws(() => A.commitLocal(bad), /拓片不存在/);
-  // 拒绝不占本地序号：下一条仍是 A:1
   const good = A.nextOp("field.update", { entity: "damages", entityId: "damage_demo_1", fields: { repairNote: "ok" } });
   A.commitLocal(good);
-  assert.equal(good.seq, 1);
+  assert.equal(good.seq, 1, "被拒操作不占站内序号");
+  assert.equal(A.project().damages.some((d) => d.id === "damage_ghost"), false);
 
-  // 外来被拒操作：经隔离/直送两种路径，重放哈希都一致
+  // 同步入口：同一报文里既有合法操作，也有引用不存在实体的非法操作——整包必须不生效
   const C = new Engine("C");
   C.seed();
-  const foreignReject = {
-    opId: "X:1",
-    site: "X",
+  const legal = {
+    opId: "Y:1",
+    site: "Y",
     seq: 1,
+    type: "rubbing.create",
+    payload: { id: "rubbing_legal", fields: { code: "C", source: "s", paperSize: "p", note: "", createdAt: "t" } },
+    vclock: { seed: 3 },
+    causes: ["seed:3"],
+    at: "t"
+  };
+  const illegal = {
+    opId: "Y:2",
+    site: "Y",
+    seq: 2,
     type: "damage.create",
     payload: {
       id: "damage_ghost2",
@@ -124,18 +134,65 @@ test("被业务规则拒绝的操作跨馆重放结果一致（占用序号、�
         status: "pending",
         repairNote: "",
         batchId: null,
-        createdAt: "2026-01-01T00:00:00.000Z",
+        createdAt: "t",
         repairedAt: null
       }
     },
+    vclock: { seed: 3, Y: 1 },
+    causes: ["Y:1"],
+    at: "t"
+  };
+  const hashBefore = C.stateHash();
+  assert.throws(() => C.ingest([legal, illegal]), /拓片不存在/);
+  // 合法操作也不得落地
+  assert.equal(C.project().rubbings.some((r) => r.id === "rubbing_legal"), false);
+  assert.equal(C.project().damages.some((d) => d.id === "damage_ghost2"), false);
+  assert.equal(C.meta().vclock.Y, undefined);
+  assert.equal(C.stateHash(), hashBefore, "整包回滚后状态必须与调用前完全一致");
+  assert.equal(C.stateHash(true), C.stateHash());
+
+  // 非法操作不会污染后续合法同步
+  const onlyLegal = C.ingest([legal]);
+  assert.deepEqual(onlyLegal.applied, ["Y:1"]);
+  assert.ok(C.project().rubbings.some((r) => r.id === "rubbing_legal"));
+});
+
+test("field.update 合法与非法字段同包：合法字段也不得部分写入", () => {
+  const E = new Engine("E").seed();
+  const mixed = {
+    opId: "X:1",
+    site: "X",
+    seq: 1,
+    type: "field.update",
+    payload: { entity: "damages", entityId: "damage_demo_1", fields: { repairNote: "合法", hacked: "非法" } },
     vclock: { seed: 3 },
     causes: ["seed:3"],
-    at: "2026-01-01T00:00:00.000Z"
+    at: "t"
   };
-  const report = C.ingest([foreignReject]);
-  assert.deepEqual(report.applied, ["X:1"]); // 已生效（含拒绝标记），不进隔离
-  assert.equal(C.project().damages.some((d) => d.id === "damage_ghost2"), false);
-  assert.equal(C.stateHash(true), C.stateHash(), "含拒绝操作的重放必须与在线投影一致");
+  const before = E.stateHash();
+  assert.throws(() => E.ingest([mixed]), /不可写字段：hacked/);
+  const dmg = E.project().damages.find((d) => d.id === "damage_demo_1");
+  assert.equal(dmg.repairNote, "", "合法字段不得部分落地");
+  assert.equal(dmg.hacked, undefined, "非法字段不得存在");
+  assert.equal(E.stateHash(), before);
+  assert.equal(E.stateHash(true), E.stateHash());
+});
+
+test("未知操作类型整包拒绝且不留状态", () => {
+  const E = new Engine("E").seed();
+  const weird = {
+    opId: "Z:1",
+    site: "Z",
+    seq: 1,
+    type: "totally.unknown",
+    payload: {},
+    vclock: { seed: 3 },
+    causes: ["seed:3"],
+    at: "t"
+  };
+  const before = E.stateHash();
+  assert.throws(() => E.ingest([weird]), /未知操作类型/);
+  assert.equal(E.stateHash(), before);
 });
 
 test("向量时钟比较正确", () => {
