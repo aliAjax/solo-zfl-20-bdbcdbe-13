@@ -1,0 +1,16 @@
+{
+  "name": "rubbing-repair-api",
+  "version": "2.0.0",
+  "description": "古籍拓片缺损修补 API —— 多馆离线协作版（因果版本、增量同步、冲突保留）",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/",
+    "sync": "node scripts/sync-once.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}

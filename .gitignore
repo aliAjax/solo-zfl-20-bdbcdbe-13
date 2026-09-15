@@ -4,6 +4,12 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# 多馆运行时状态（保留旧版 data/db.json 作为初始样例）
+data/state.json
+data/state.json.tmp
+data/*/state.json
+data/*/state.json.tmp
+
 .env
 .env.*
 !.env.example
