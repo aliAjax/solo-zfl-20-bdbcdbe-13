@@ -9,7 +9,7 @@
 const http = require("http");
 const path = require("path");
 const { Replica } = require("./lib/replica");
-const { EngineError } = require("./lib/engine");
+const { EngineError, validateEnvelope } = require("./lib/engine");
 const { exchange, makeHttpClient } = require("./lib/sync");
 
 const PORT = Number(process.env.PORT || 3020);
@@ -319,10 +319,15 @@ async function createServer({ site = SITE, dataDir = DATA_DIR, port = 0, failWri
     // 请求方声明能力，导出方据此裁剪（旧副本拿不到墓碑标记）。
     if (req.method === "POST" && pathname === "/sync/pull") {
       const body = await parseBody(req);
+      // fail-closed：信封未知字段在任何状态访问前拒绝（pull 虽为只读也不得放行未知协议数据）
+      try {
+        validateEnvelope("pull", body);
+      } catch (error) {
+        return send(res, error.status || 409, { error: error.message, retryable: true });
+      }
       const vclock = body.vclock && typeof body.vclock === "object" ? body.vclock : {};
-      const requesterCaps = body.capabilities && typeof body.capabilities === "object" ? body.capabilities : null;
       // 未声明能力 = 旧副本，按最保守（无墓碑）裁剪，保证旧端不会收到无法识别的协议数据。
-      const caps = requesterCaps || { tombstones: false };
+      const caps = body.capabilities || { tombstones: false };
       const ops = replica.since(vclock, { capabilities: caps });
       return send(res, 200, {
         ops,
@@ -335,6 +340,12 @@ async function createServer({ site = SITE, dataDir = DATA_DIR, port = 0, failWri
     // 对端推送增量：{ site, ops, capabilities? } -> { report, peerVclock, ... }，整包幂等
     if (req.method === "POST" && pathname === "/sync/push") {
       const body = await parseBody(req);
+      // fail-closed：信封未知字段 / 未知能力键在任何写入前拒绝
+      try {
+        validateEnvelope("push", body);
+      } catch (error) {
+        return send(res, error.status || 409, { error: error.message, retryable: true });
+      }
       if (!Array.isArray(body.ops)) return send(res, 400, { error: "ops必须是数组" });
       try {
         const report = await replica.applyRemote(body.ops, body.site || "unknown");
@@ -354,6 +365,12 @@ async function createServer({ site = SITE, dataDir = DATA_DIR, port = 0, failWri
     // 由本馆主动向对端发起一次双向增量交换（对端地址取自 SYNC_PEERS）
     if (req.method === "POST" && pathname === "/sync/exchange") {
       const body = await parseBody(req);
+      // fail-closed：交换信封同样只接受白名单字段，未知字段在发起任何网络/状态操作前拒绝
+      try {
+        validateEnvelope("exchange", body);
+      } catch (error) {
+        return send(res, error.status || 409, { error: error.message, retryable: true });
+      }
       required(body, ["peer"]);
       const baseUrl = body.url || peers[body.peer];
       if (!baseUrl) return send(res, 400, { error: `未知对端：${body.peer}，请在 SYNC_PEERS 中配置或传 url` });

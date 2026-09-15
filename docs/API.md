@@ -173,6 +173,11 @@
     **裁剪掉所有墓碑以及因果上依赖墓碑的后继**，只返回“每个站点首个墓碑之前”的连续安全前缀，
     保证旧副本不会收到它无法解释的协议数据、不会整包失败；
   - 旧副本升级为新版后，正常声明 `tombstones:true` 再拉一次，被裁剪的墓碑与后继自动补齐，最终收敛。
+- **信封严格校验（fail-closed）**：三个同步入口（`pull`/`push`/`exchange`）都在任何状态读写前
+  校验请求顶层字段白名单（pull 仅 `site,vclock,capabilities`；push 仅 `site,ops,capabilities`；
+  exchange 仅 `peer,url`）、`capabilities` 只含已声明的能力键、操作 `payload` 任意层级都不含
+  未知 `__` 协议字段。任一项不满足即返回 `409 { error, retryable:true }`，**状态哈希与隔离区都不变**，
+  合法字段也不落地。白名单与已声明能力内的字段正常通过。
 
 ### 6. `POST /sync/push` —— 幂等推送原语
 
