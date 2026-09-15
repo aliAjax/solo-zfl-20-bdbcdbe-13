@@ -17,13 +17,21 @@ const { createServer } = require("../server");
 const tmpRoot = path.join(os.tmpdir(), `rubbing_regression_${process.pid}`);
 const live = [];
 
-async function start(site, dataDir = null) {
+async function start(site, dataDir = null, { keep = false } = {}) {
   const dir = dataDir || path.join(tmpRoot, `${site}_${Math.random().toString(36).slice(2, 8)}`);
-  await rm(dir, { recursive: true, force: true });
+  if (!keep) await rm(dir, { recursive: true, force: true });
   const svc = await createServer({ site, dataDir: dir, port: 0 });
   svc.dir = dir;
   live.push(svc);
   return svc;
+}
+
+async function restart(svc) {
+  await svc.close();
+  const idx = live.indexOf(svc);
+  const again = await start(svc.site, svc.dir, { keep: true });
+  if (idx >= 0) live[idx] = again;
+  return again;
 }
 
 function api(svc, method, urlPath, body) {
@@ -267,4 +275,125 @@ test("回归二补充：旧 PATCH 接口只接受白名单字段，行为不变"
   const dmg = res.body.data;
   assert.equal(dmg.repairNote, "正常修改");
   assert.equal(dmg.isAdmin, undefined, "非白名单字段不得写入");
+});
+
+// ---------------------------------------------------------------------------
+// 隔离区缺陷回归：结构非法的后继先因缺前序被隔离；补发合法前序时，
+// 旧实现把整批（含前序）一起回滚，前序重试又幂等为空 -> 坏操作永久卡住、
+// 该馆站内序号链断开、后续同步被阻塞。
+//
+// 修复后：合法前序正常生效；非法后继补链时被明确拒绝、移出隔离区并以墓碑占位；
+// 该馆后续操作不再被阻塞；墓碑持久化并跨馆传播；各馆收敛、在线==重放。
+// ---------------------------------------------------------------------------
+
+test("回归三：非法后继先隔离，补链时合法前序生效、坏后继落墓碑且不永久阻塞", async () => {
+  const R = await start("quarR");
+
+  // X:1 合法（建拓片）；X:2 非法后继（更新不存在的缺损）；X:3 合法后继
+  const x1 = {
+    opId: "badX:1",
+    site: "badX",
+    seq: 1,
+    type: "rubbing.create",
+    payload: { id: "rubbing_q", fields: { code: "TP-Q", source: "s", paperSize: "1x1", note: "", createdAt: "t" } },
+    vclock: { seed: 3 },
+    causes: ["seed:3"],
+    at: "t"
+  };
+  const x2 = {
+    opId: "badX:2",
+    site: "badX",
+    seq: 2,
+    type: "field.update",
+    payload: { entity: "damages", entityId: "damage_ghost_q", fields: { status: "repaired" } },
+    vclock: { seed: 3, badX: 1 },
+    causes: ["badX:1"],
+    at: "t"
+  };
+  const x3 = {
+    opId: "badX:3",
+    site: "badX",
+    seq: 3,
+    type: "field.update",
+    payload: { entity: "damages", entityId: "damage_demo_1", fields: { repairNote: "X3合法后继" } },
+    vclock: { seed: 3, badX: 2 },
+    causes: ["badX:2"],
+    at: "t"
+  };
+
+  // 第一步：只送达坏后继 X:2（缺 X:1）-> 隔离，不报错
+  const isolated = await post(R, "/sync/push", { site: "feeder", ops: [x2] });
+  assert.equal(isolated.status, 200);
+  assert.deepEqual(isolated.body.data.quarantined, ["badX:2"]);
+  assert.ok(isolated.body.data.missing.includes("badX:1"));
+  assert.equal((await get(R, "/quarantine")).body.count, 1);
+
+  // 第二步（缺陷点）：补发合法前序 X:1。
+  // 旧实现整批回滚：X:1 落不了地；这里要求 X:1 生效，X:2 被明确拒绝并移出隔离区。
+  const filled = await post(R, "/sync/push", { site: "feeder", ops: [x1] });
+  assert.equal(filled.status, 200, JSON.stringify(filled.body));
+  assert.deepEqual(filled.body.data.applied, ["badX:1"]);
+  assert.deepEqual(filled.body.data.rejected, ["badX:2"]);
+  assert.equal(filled.body.data.rejectionReasons["badX:2"], "实体不存在");
+  assert.equal((await get(R, "/quarantine")).body.count, 0, "坏操作必须移出隔离区");
+  assert.equal(
+    (await get(R, "/rubbings")).body.data.some((r) => r.id === "rubbing_q"),
+    true,
+    "合法前序必须正常生效"
+  );
+  // 坏操作没有产生任何业务状态
+  assert.equal(
+    (await get(R, "/damages")).body.data.some((d) => d.id === "damage_ghost_q"),
+    false
+  );
+
+  // 前序重发必须幂等（旧实现正是在这里：重发为空、又永远解不开）
+  const retry = await post(R, "/sync/push", { site: "feeder", ops: [x1] });
+  assert.deepEqual(retry.body.data.applied, []);
+  assert.deepEqual(retry.body.data.duplicate, ["badX:1"]);
+
+  // 第三步：链不再被永久阻塞——X:3 正常生效
+  const after = await post(R, "/sync/push", { site: "feeder", ops: [x3] });
+  assert.equal(after.status, 200, JSON.stringify(after.body));
+  assert.deepEqual(after.body.data.applied, ["badX:3"]);
+  assert.equal(
+    (await get(R, "/damages")).body.data.find((d) => d.id === "damage_demo_1").repairNote,
+    "X3合法后继"
+  );
+
+  // 状态里能看到被拒墓碑，且在线==重放
+  const st = (await get(R, "/sync/status")).body.data;
+  assert.deepEqual(st.invalid.map((i) => i.opId), ["badX:2"]);
+  assert.equal(st.vclock.badX, 3, "被拒操作必须占住站内序号 2，使 3 不断链");
+  assert.equal(st.replayConvergent, true);
+
+  // 第四步：重启后墓碑持久化，隔离仍为空，仍收敛
+  const R2 = await restart(R);
+  const st2 = (await get(R2, "/sync/status")).body.data;
+  assert.deepEqual(st2.invalid.map((i) => i.opId), ["badX:2"]);
+  assert.deepEqual(st2.quarantined, []);
+  assert.equal(st2.replayConvergent, true);
+
+  // 第五步：墓碑跨馆传播——新馆按乱序收到含墓碑的操作集，确定性占位、不报 409、最终收敛
+  const T = await start("quarT");
+  const log = JSON.parse(JSON.stringify(st2 && R2)); // 仅占位避免未用警告
+  void log;
+  // 乱序：先 X:3（缺 1、2，隔离），再 X:1 与带墓碑标记的 X:2 一起
+  const t1 = await post(T, "/sync/push", { site: "feeder", ops: [x3] });
+  assert.equal(t1.status, 200);
+  assert.deepEqual(t1.body.data.quarantined, ["badX:3"]);
+  // 从 R2 拉取它已落定的操作（X:2 带 __invalid 墓碑标记）并推给 T
+  const pulled = (await post(R2, "/sync/pull", { site: "quarT", vclock: { seed: 3 } })).body.ops;
+  const ids = pulled.map((o) => o.opId).sort();
+  assert.deepEqual(ids, ["badX:1", "badX:2", "badX:3"]);
+  assert.equal(pulled.find((o) => o.opId === "badX:2").__invalid, true);
+  const t2 = await post(T, "/sync/push", { site: "quarR", ops: pulled });
+  assert.equal(t2.status, 200, `含墓碑的同步不得 409：${JSON.stringify(t2.body)}`);
+  assert.equal((await get(T, "/quarantine")).body.count, 0);
+  assert.deepEqual((await get(T, "/sync/status")).body.data.invalid.map((i) => i.opId), ["badX:2"]);
+
+  // 两馆状态哈希一致、各自在线==重放
+  const hashR = (await get(R2, "/sync/status")).body.data.stateHash;
+  const hashT = (await get(T, "/sync/status")).body.data.stateHash;
+  assert.equal(hashR, hashT, "墓碑传播后两馆必须收敛到同一状态");
 });
